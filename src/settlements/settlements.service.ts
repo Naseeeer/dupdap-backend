@@ -4,7 +4,7 @@ import { Queue } from 'bull';
 import axios from 'axios';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { InjectRepository } from '@nestjs/typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import { DataSource, EntityManager, IsNull, Raw, Repository } from 'typeorm';
 import axios from 'axios';
 import { Settlement, SettlementStatus } from './entities/settlement.entity';
@@ -70,7 +70,7 @@ export class SettlementsService {
     private readonly stellar: StellarService,
     private readonly cronJobService: CronJobService,
     private readonly retryConfig: RetryConfigService,
-    private readonly dataSource?: DataSource,
+    @InjectDataSource() private readonly dataSource?: DataSource,
   ) {
     this.settlementsRepo = settlementsRepo as Repository<Settlement>;
     this.paymentsRepo = paymentsRepo as Repository<Payment>;
@@ -396,6 +396,12 @@ export class SettlementsService {
       payment.status = PaymentStatus.CONFIRMED;
       payment.settlementId = null;
       await this.paymentsRepo.save(payment);
+
+      await this.webhooks.dispatch(settlement.merchantId, 'payment.settlement_rejected', {
+        paymentId: payment.id,
+        settlementId: settlement.id,
+        reason: settlement.failureReason,
+      });
     }
 
     for (const payment of payments) {
@@ -428,6 +434,15 @@ export class SettlementsService {
       .orderBy('settlement.createdAt', 'DESC');
 
     if (query.status) qb.andWhere('settlement.status = :status', { status: query.status });
+
+    const dateColumn =
+      query.dateField === 'completed' ? 'settlement.completedAt' : 'settlement.createdAt';
+    if (query.dateFrom) {
+      qb.andWhere(`${dateColumn} >= :dateFrom`, { dateFrom: new Date(query.dateFrom) });
+    }
+    if (query.dateTo) {
+      qb.andWhere(`${dateColumn} <= :dateTo`, { dateTo: new Date(query.dateTo) });
+    }
     if (query.merchantId)
       qb.andWhere('settlement.merchantId = :merchantId', { merchantId: query.merchantId });
     if (query.requiresApproval !== undefined) {
