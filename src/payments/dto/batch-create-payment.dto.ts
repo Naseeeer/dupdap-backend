@@ -65,7 +65,7 @@ export class BatchCreatePaymentDto {
   })
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(20)
+  @ArrayMaxSize(20, { message: 'payments must contain no more than 20 items' })
   @ValidateNested({ each: true })
   @Type(() => BatchPaymentItemDto)
   payments: BatchPaymentItemDto[];
