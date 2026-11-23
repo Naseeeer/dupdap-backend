@@ -1,7 +1,14 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  UnauthorizedException,
+  Logger,
+} from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import { ConfigService } from '@nestjs/config';
+import { createHmac, timingSafeEqual } from 'crypto';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Settlement, SettlementStatus } from './entities/settlement.entity';
@@ -23,8 +30,16 @@ interface SettlementDecisionResult {
   settlement: Settlement;
 }
 
+export interface PartnerCallbackPayload {
+  reference: string;
+  status: string;
+  [key: string]: unknown;
+}
+
 @Injectable()
 export class SettlementsService {
+  private readonly logger = new Logger(SettlementsService.name);
+
   constructor(
     settlementsRepo?: Repository<Settlement>,
     paymentsRepo?: Repository<Payment>,
@@ -160,6 +175,100 @@ export class SettlementsService {
       limit: query.limit,
       pages: Math.ceil(total / query.limit),
     };
+  }
+
+  // ── Partner callback (#825) ────────────────────────────────────────────────
+
+  async handlePartnerCallback(
+    payload: PartnerCallbackPayload,
+    signature?: string,
+    rawBody?: Buffer | string,
+  ): Promise<{ success: boolean }> {
+    this.verifyPartnerSignature(signature, rawBody, payload);
+
+    const settlement = await this.settlementsRepo.findOne({
+      where: { id: payload.reference },
+      relations: ['payments'],
+    });
+    if (!settlement) throw new NotFoundException('Settlement not found');
+
+    if (settlement.status === SettlementStatus.COMPLETED) {
+      return { success: true };
+    }
+
+    if (payload.status === 'success') {
+      settlement.status = SettlementStatus.COMPLETED;
+      await this.settlementsRepo.save(settlement);
+
+      for (const payment of settlement.payments ?? []) {
+        payment.status = PaymentStatus.SETTLED;
+        await this.paymentsRepo.save(payment);
+        await this.stellar.invokeContract('settle', [payment.id, settlement.id]);
+        await this.webhooks.dispatch(settlement.merchantId, 'payment.settled', {
+          paymentId: payment.id,
+          settlementId: settlement.id,
+          amount: Number(payment.amountUsd),
+        });
+      }
+
+      this.analytics.clearCacheForMerchant(settlement.merchantId);
+    } else {
+      settlement.status = SettlementStatus.FAILED;
+      settlement.failureReason = `Partner reported status: ${payload.status}`;
+      await this.settlementsRepo.save(settlement);
+
+      for (const payment of settlement.payments ?? []) {
+        payment.status = PaymentStatus.FAILED;
+        await this.paymentsRepo.save(payment);
+      }
+
+      await this.adminAlerts.raise({
+        type: AdminAlertType.SETTLEMENT_FAILURE,
+        message: `Settlement ${settlement.id} failed: ${payload.status}`,
+        dedupeKey: `settlement:${settlement.id}`,
+      });
+    }
+
+    return { success: true };
+  }
+
+  private verifyPartnerSignature(
+    signature: string | undefined,
+    rawBody: Buffer | string | undefined,
+    payload: PartnerCallbackPayload,
+  ): void {
+    if (!signature) {
+      this.logger.warn('[SECURITY] Partner callback missing X-Partner-Signature header', {
+        reference: payload?.reference,
+      });
+      throw new UnauthorizedException('Missing signature');
+    }
+
+    const secret = this.config.get<string>('PARTNER_WEBHOOK_SECRET');
+    if (!secret) {
+      this.logger.error('[SECURITY] PARTNER_WEBHOOK_SECRET is not configured');
+      throw new UnauthorizedException('Signature verification unavailable');
+    }
+
+    const body = rawBody ?? Buffer.from(JSON.stringify(payload ?? {}));
+    const expected = createHmac('sha256', secret).update(body).digest('hex');
+
+    let valid = false;
+    try {
+      const expectedBuf = Buffer.from(expected, 'hex');
+      const receivedBuf = Buffer.from(signature.replace(/^sha256=/, ''), 'hex');
+      valid =
+        expectedBuf.length === receivedBuf.length && timingSafeEqual(expectedBuf, receivedBuf);
+    } catch {
+      valid = false;
+    }
+
+    if (!valid) {
+      this.logger.warn('[SECURITY] Partner callback signature mismatch — possible forgery', {
+        reference: payload?.reference,
+      });
+      throw new UnauthorizedException('Invalid signature');
+    }
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
