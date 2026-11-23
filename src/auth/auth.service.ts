@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException, ConflictException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -10,27 +10,29 @@ import { LoginDto } from './dto/login.dto';
 import type { AuthTokenResponseDto } from './dto/auth-token-response.dto';
 import { CacheService } from '../cache/cache.service';
 
-/** Failed password attempts before a temporary lockout is applied. */
-const LOGIN_MAX_FAILED_ATTEMPTS = 5;
-/** Lockout / failed-attempt counter window (15 minutes). */
-const LOGIN_LOCKOUT_TTL_SECONDS = 15 * 60;
+/** Failed login attempts allowed before the account is locked. */
+export const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+/** How long a lockout lasts, in seconds. */
+export const LOGIN_LOCKOUT_SECONDS = 15 * 60;
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     @InjectRepository(Merchant)
-    private merchantsRepo: Repository<Merchant>,
-    private jwtService: JwtService,
-    private cacheService: CacheService,
+    private readonly merchants: Repository<Merchant>,
+    private readonly jwtService: JwtService,
+    private readonly cache: CacheService,
   ) {}
 
   async register(dto: RegisterDto): Promise<AuthTokenResponseDto> {
-    const existing = await this.merchantsRepo.findOne({ where: { email: dto.email } });
+    const existing = await this.merchants.findOne({ where: { email: dto.email } });
     if (existing) throw new ConflictException('Email already registered');
 
     const passwordHash = await bcrypt.hash(dto.password, 12);
 
-    const merchant = this.merchantsRepo.create({
+    const merchant = this.merchants.create({
       email: dto.email,
       passwordHash,
       businessName: dto.businessName,
@@ -39,50 +41,70 @@ export class AuthService {
       status: MerchantStatus.ACTIVE,
     });
 
-    const saved = await this.merchantsRepo.save(merchant);
+    const saved = await this.merchants.save(merchant);
     const token = this.signToken(saved.id, saved.email, saved.role);
 
     return { accessToken: token, merchant: saved };
   }
 
+  private failedAttemptsKey(email: string): string {
+    return `auth:failed-attempts:${email.toLowerCase()}`;
+  }
+
+  private lockoutKey(email: string): string {
+    return `auth:lockout:${email.toLowerCase()}`;
+  }
+
+  /**
+   * Clears the failed-attempt counter and any active lockout for an account.
+   * Called on every successful login so a lockout earned on one device does
+   * not persist for the next login from another device.
+   */
+  async clearFailedLogin(email: string): Promise<void> {
+    await Promise.all([
+      this.cache.del(this.failedAttemptsKey(email)),
+      this.cache.del(this.lockoutKey(email)),
+    ]);
+  }
+
   async login(dto: LoginDto): Promise<AuthTokenResponseDto> {
-    const emailKey = dto.email.toLowerCase();
-    await this.assertNotLockedOut(emailKey);
+    const email = dto.email.toLowerCase();
 
-    const merchant = await this.merchantsRepo.findOne({ where: { email: dto.email } });
-    if (!merchant) {
-      await this.recordFailedLogin(emailKey);
+    if (await this.cache.get<boolean>(this.lockoutKey(email))) {
+      throw new UnauthorizedException('Account temporarily locked. Try again later.');
+    }
+
+    const merchant = await this.merchants.findOne({ where: { email } });
+    const passwordMatches = merchant
+      ? await bcrypt.compare(dto.password, merchant.passwordHash)
+      : false;
+
+    if (!merchant || !passwordMatches) {
+      await this.registerFailedLogin(email);
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const valid = await bcrypt.compare(dto.password, merchant.passwordHash);
-    if (!valid) {
-      await this.recordFailedLogin(emailKey);
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
-    if (merchant.status === MerchantStatus.SUSPENDED) {
+    if (merchant.status === MerchantStatus.SUSPENDED || merchant.suspended) {
       throw new UnauthorizedException('Account suspended');
     }
 
-    await this.clearFailedLogin(emailKey);
+    await this.clearFailedLogin(email);
 
-    const token = this.signToken(merchant.id, merchant.email, merchant.role);
-    return { accessToken: token, merchant };
+    return { accessToken: this.signToken(merchant.id, merchant.email, merchant.role), merchant };
   }
 
   async logout(jti: string, ttlSeconds: number): Promise<void> {
-    await this.cacheService.set(`session:blacklist:${jti}`, true, { ttlSeconds });
+    await this.cache.set(`session:blacklist:${jti}`, true, { ttlSeconds });
   }
 
   async isBlacklisted(jti: string): Promise<boolean> {
-    const entry = await this.cacheService.get<boolean>(`session:blacklist:${jti}`);
+    const entry = await this.cache.get<boolean>(`session:blacklist:${jti}`);
     return entry === true;
   }
 
   async findMerchantByApiKey(rawKey: string): Promise<Merchant | null> {
     const lookupHash = createHash('sha256').update(rawKey).digest('hex');
-    const merchant = await this.merchantsRepo.findOne({
+    const merchant = await this.merchants.findOne({
       where: { apiKeyLookupHash: lookupHash },
     });
 
@@ -90,40 +112,18 @@ export class AuthService {
     return (await bcrypt.compare(rawKey, merchant.apiKeyHash)) ? merchant : null;
   }
 
-  private failedAttemptsKey(emailKey: string): string {
-    return `auth:failed:${emailKey}`;
-  }
+  private async registerFailedLogin(email: string): Promise<void> {
+    const key = this.failedAttemptsKey(email);
+    const attempts = ((await this.cache.get<number>(key)) ?? 0) + 1;
 
-  private lockoutKey(emailKey: string): string {
-    return `auth:lockout:${emailKey}`;
-  }
-
-  private async assertNotLockedOut(emailKey: string): Promise<void> {
-    const locked = await this.cacheService.get<boolean>(this.lockoutKey(emailKey));
-    if (locked) {
-      throw new UnauthorizedException('Account temporarily locked. Try again later.');
-    }
-  }
-
-  private async recordFailedLogin(emailKey: string): Promise<void> {
-    const attemptsKey = this.failedAttemptsKey(emailKey);
-    const current = (await this.cacheService.get<number>(attemptsKey)) ?? 0;
-    const next = current + 1;
-
-    if (next >= LOGIN_MAX_FAILED_ATTEMPTS) {
-      await this.cacheService.set(this.lockoutKey(emailKey), true, {
-        ttlSeconds: LOGIN_LOCKOUT_TTL_SECONDS,
-      });
-      await this.cacheService.del(attemptsKey);
+    if (attempts >= MAX_FAILED_LOGIN_ATTEMPTS) {
+      await this.cache.set(this.lockoutKey(email), true, { ttlSeconds: LOGIN_LOCKOUT_SECONDS });
+      await this.cache.del(key);
+      this.logger.warn(`Account locked after ${attempts} failed login attempts: ${email}`);
       return;
     }
 
-    await this.cacheService.set(attemptsKey, next, { ttlSeconds: LOGIN_LOCKOUT_TTL_SECONDS });
-  }
-
-  private async clearFailedLogin(emailKey: string): Promise<void> {
-    await this.cacheService.del(this.failedAttemptsKey(emailKey));
-    await this.cacheService.del(this.lockoutKey(emailKey));
+    await this.cache.set(key, attempts, { ttlSeconds: LOGIN_LOCKOUT_SECONDS });
   }
 
   private signToken(sub: string, email: string, role?: string): string {
