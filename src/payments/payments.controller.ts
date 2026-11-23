@@ -1,4 +1,19 @@
-import { Controller, Post, Get, Param, Body, Query, UseGuards, UseFilters, Request, UseInterceptors, ParseUUIDPipe, ClassSerializerInterceptor } from '@nestjs/common';
+import {
+  Controller,
+  Post,
+  Get,
+  Param,
+  Body,
+  Query,
+  UseGuards,
+  UseFilters,
+  Request,
+  UseInterceptors,
+  ParseUUIDPipe,
+  ClassSerializerInterceptor,
+  Res,
+} from '@nestjs/common';
+import type { Response } from 'express';
 import {
   ApiTags,
   ApiBearerAuth,
@@ -25,6 +40,7 @@ import { PaymentsQueryDto } from './dto/payments-query.dto';
 import { IdempotencyInterceptor } from './idempotency.interceptor';
 import { Auditable } from '../audit/decorators/auditable.decorator';
 import { TransactionLimitFilter } from './transaction-limit.filter';
+import { PaymentCreationRateLimitService } from './payment-creation-rate-limit.service';
 
 import { maskEmail } from './dto/public-payment-view.dto';
 
@@ -35,7 +51,10 @@ import { maskEmail } from './dto/public-payment-view.dto';
 @UseFilters(TransactionLimitFilter)
 @Controller('payments')
 export class PaymentsController {
-  constructor(private readonly paymentsService: PaymentsService) {}
+  constructor(
+    private readonly paymentsService: PaymentsService,
+    private readonly paymentCreationRateLimit: PaymentCreationRateLimitService,
+  ) {}
 
   @Post()
   @Scopes('payments:write')
@@ -47,8 +66,13 @@ export class PaymentsController {
   @ApiUnauthorizedResponse({ description: 'Missing or invalid JWT / API key' })
   @ApiForbiddenResponse({ description: 'API key missing payments:write scope' })
   @ApiBadRequestResponse({ description: 'Validation failed' })
+  @ApiResponse({ status: 429, description: 'Payment creation rate limit exceeded (Retry-After header set)' })
   @ApiResponse({ status: 500, description: 'Internal server error' })
-  create(@Request() req: { user: { merchantId: string } }, @Body() dto: CreatePaymentDto) {
+  async create(
+    @Request() req: { user: { merchantId: string }; headers: Record<string, string | string[] | undefined> },
+    @Body() dto: CreatePaymentDto,
+  ) {
+    await this.enforceCreationRateLimit(req);
     return this.paymentsService.create(req.user.merchantId, dto);
   }
 
@@ -124,6 +148,62 @@ export class PaymentsController {
     return this.paymentsService.findOne(id, req.user.merchantId);
   }
 
+  @Get(':id/receipt')
+  @Scopes('payments:read')
+  @ApiOperation({
+    summary: 'Download an HTML receipt for a payment',
+    description:
+      'Returns a printable HTML receipt containing the payment ID, amount, date, merchant name and status.',
+  })
+  @ApiParam({ name: 'id', description: 'Payment UUID' })
+  @ApiOkResponse({ description: 'HTML receipt', content: { 'text/html': {} } })
+  @ApiUnauthorizedResponse({ description: 'Missing or invalid JWT / API key' })
+  @ApiForbiddenResponse({ description: 'API key missing payments:read scope' })
+  @ApiNotFoundResponse({ description: 'Payment not found' })
+  @ApiResponse({ status: 500, description: 'Internal server error' })
+  async receipt(
+    @Request() req: { user: { merchantId: string } },
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ) {
+    const payment = await this.paymentsService.findOne(id, req.user.merchantId);
+    const merchantName = payment?.merchant?.businessName ?? payment?.merchantId ?? 'Unknown merchant';
+    const amount = payment?.amountUsd ?? '0';
+    const date = payment?.createdAt ? new Date(payment.createdAt).toISOString() : '';
+    const status = payment?.status ?? 'unknown';
+    const escape = (value: unknown) =>
+      String(value ?? '').replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string,
+      );
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Receipt ${escape(payment?.id)}</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #111; }
+h1 { font-size: 1.25rem; }
+table { border-collapse: collapse; min-width: 320px; }
+th, td { text-align: left; padding: 0.5rem 1rem; border-bottom: 1px solid #ddd; }
+th { width: 40%; color: #555; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Payment Receipt</h1>
+<table>
+<tr><th>Payment ID</th><td>${escape(payment?.id)}</td></tr>
+<tr><th>Amount (USD)</th><td>${escape(amount)}</td></tr>
+<tr><th>Date</th><td>${escape(date)}</td></tr>
+<tr><th>Merchant</th><td>${escape(merchantName)}</td></tr>
+<tr><th>Status</th><td>${escape(status)}</td></tr>
+</table>
+</body>
+</html>`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Content-Disposition', `inline; filename="receipt-${payment?.id ?? id}.html"`);
+    res.send(html);
+  }
+
   @Post(':id/cancel')
   @Scopes('payments:write')
   @UseInterceptors(ClassSerializerInterceptor)
@@ -153,6 +233,20 @@ export class PaymentsController {
     @Body() dto: RefundPaymentDto,
   ) {
     return this.paymentsService.refund(id, req.user.merchantId, dto);
+  }
+
+  /**
+   * Enforces the per-API-key payment creation rate limit (#809). Requests
+   * without an API key (bearer JWT sessions) are not limited here.
+   */
+  private async enforceCreationRateLimit(req: {
+    user: { merchantId: string };
+    headers: Record<string, string | string[] | undefined>;
+  }): Promise<void> {
+    const rawKey = req.headers['x-api-key'];
+    const apiKey = Array.isArray(rawKey) ? rawKey[0] : rawKey;
+    if (typeof apiKey !== 'string' || apiKey.trim().length === 0) return;
+    await this.paymentCreationRateLimit.checkAndIncrement(apiKey.trim());
   }
 }
 
