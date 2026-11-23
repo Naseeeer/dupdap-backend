@@ -557,6 +557,29 @@ describe('SettlementsService handlePartnerCallback', () => {
     expect(analytics.clearCacheForMerchant).not.toHaveBeenCalled();
   });
 
+  it('ignores duplicate callback for already-failed settlement', async () => {
+    const payment = { id: 'p1', amountUsd: '100.000000', status: PaymentStatus.FAILED } as Payment;
+    const settlement = {
+      id: 'settlement-1',
+      merchantId: 'merchant-xyz',
+      payments: [payment],
+      status: SettlementStatus.FAILED,
+    } as Settlement;
+
+    settlementsRepo.findOne.mockResolvedValue(settlement);
+
+    const result = await service.handlePartnerCallback({
+      reference: 'settlement-1',
+      status: 'success',
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(settlementsRepo.save).not.toHaveBeenCalled();
+    expect(paymentsRepo.save).not.toHaveBeenCalled();
+    expect(stellar.invokeContract).not.toHaveBeenCalled();
+    expect(webhooks.dispatch).not.toHaveBeenCalled();
+  });
+
   it('returns early for unknown settlement reference', async () => {
     settlementsRepo.findOne.mockResolvedValue(null);
 

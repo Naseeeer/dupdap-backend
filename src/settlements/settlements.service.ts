@@ -192,7 +192,13 @@ export class SettlementsService {
     });
     if (!settlement) throw new NotFoundException('Settlement not found');
 
-    if (settlement.status === SettlementStatus.COMPLETED) {
+    if (
+      settlement.status === SettlementStatus.COMPLETED ||
+      settlement.status === SettlementStatus.FAILED
+    ) {
+      this.logger.log(
+        `[IDEMPOTENCY] Duplicate partner callback ignored for settlement ${settlement.id} (status: ${settlement.status})`,
+      );
       return { success: true };
     }
 
