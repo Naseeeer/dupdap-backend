@@ -38,21 +38,167 @@ export enum KycStatus { UNVERIFIED = 'UNVERIFIED', PENDING = 'PENDING', VERIFIED
 
 /**
  * Maps a merchant's country to the fiat currency used for its settlements.
- * Falls back to USD for unknown/missing countries so settlements are never
- * silently denominated in an unrelated currency.
+ * Covers the fiat currencies supported by Stellar anchors (SEP-24/SEP-31
+ * off-ramps). Falls back to USD for unknown/missing countries so settlements
+ * are never silently denominated in an unrelated currency.
  */
 export const COUNTRY_SETTLEMENT_CURRENCY: Record<string, string> = {
+  // Africa
   NG: 'NGN',
+  GH: 'GHS',
+  KE: 'KES',
+  ZA: 'ZAR',
+  TZ: 'TZS',
+  UG: 'UGX',
+  RW: 'RWF',
+  ZM: 'ZMW',
+  MW: 'MWK',
+  MZ: 'MZN',
+  BW: 'BWP',
+  NA: 'NAD',
+  LS: 'LSL',
+  SZ: 'SZL',
+  ET: 'ETB',
+  EG: 'EGP',
+  MA: 'MAD',
+  TN: 'TND',
+  DZ: 'DZD',
+  SN: 'XOF',
+  CI: 'XOF',
+  ML: 'XOF',
+  BF: 'XOF',
+  BJ: 'XOF',
+  TG: 'XOF',
+  NE: 'XOF',
+  GW: 'XOF',
+  CM: 'XAF',
+  GA: 'XAF',
+  CG: 'XAF',
+  TD: 'XAF',
+  CF: 'XAF',
+  GQ: 'XAF',
+  CD: 'CDF',
+  AO: 'AOA',
+  // Americas
   US: 'USD',
+  CA: 'CAD',
+  MX: 'MXN',
+  BR: 'BRL',
+  AR: 'ARS',
+  CL: 'CLP',
+  CO: 'COP',
+  PE: 'PEN',
+  UY: 'UYU',
+  PY: 'PYG',
+  BO: 'BOB',
+  EC: 'USD',
+  PA: 'USD',
+  SV: 'USD',
+  GT: 'GTQ',
+  CR: 'CRC',
+  DO: 'DOP',
+  JM: 'JMD',
+  TT: 'TTD',
+  HT: 'HTG',
+  // Europe
   GB: 'GBP',
+  IE: 'EUR',
+  DE: 'EUR',
+  FR: 'EUR',
+  ES: 'EUR',
+  IT: 'EUR',
+  PT: 'EUR',
+  NL: 'EUR',
+  BE: 'EUR',
+  AT: 'EUR',
+  FI: 'EUR',
+  GR: 'EUR',
+  LU: 'EUR',
+  SK: 'EUR',
+  SI: 'EUR',
+  EE: 'EUR',
+  LV: 'EUR',
+  LT: 'EUR',
+  CY: 'EUR',
+  MT: 'EUR',
+  HR: 'EUR',
+  CH: 'CHF',
+  SE: 'SEK',
+  NO: 'NOK',
+  DK: 'DKK',
+  PL: 'PLN',
+  CZ: 'CZK',
+  HU: 'HUF',
+  RO: 'RON',
+  BG: 'BGN',
+  TR: 'TRY',
+  UA: 'UAH',
+  RS: 'RSD',
+  IS: 'ISK',
+  // Middle East & Asia
+  AE: 'AED',
+  SA: 'SAR',
+  QA: 'QAR',
+  KW: 'KWD',
+  BH: 'BHD',
+  OM: 'OMR',
+  JO: 'JOD',
+  IL: 'ILS',
+  LB: 'LBP',
+  IQ: 'IQD',
+  IR: 'IRR',
+  PK: 'PKR',
+  IN: 'INR',
+  BD: 'BDT',
+  LK: 'LKR',
+  NP: 'NPR',
+  PH: 'PHP',
+  ID: 'IDR',
+  MY: 'MYR',
+  SG: 'SGD',
+  TH: 'THB',
+  VN: 'VND',
+  CN: 'CNY',
+  HK: 'HKD',
+  TW: 'TWD',
+  JP: 'JPY',
+  KR: 'KRW',
+  KZ: 'KZT',
+  UZ: 'UZS',
+  GE: 'GEL',
+  AM: 'AMD',
+  AZ: 'AZN',
+  // Oceania
   AU: 'AUD',
+  NZ: 'NZD',
+  FJ: 'FJD',
+  PG: 'PGK',
 };
 
-export function settlementCurrencyForCountry(country?: string | null): string {
-  if (!country) {
-    return 'USD';
-  }
-  return COUNTRY_SETTLEMENT_CURRENCY[country.toUpperCase()] ?? 'USD';
+/** Currency used when a country has no explicit settlement currency mapping. */
+export const DEFAULT_SETTLEMENT_CURRENCY = 'USD';
+
+/**
+ * Resolves the settlement currency for a country code, optionally using an
+ * admin-configured mapping (RuntimeConfig `settlements.country_currency_map`).
+ * Returns `undefined` when the country is unknown and no default is allowed.
+ */
+export function resolveSettlementCurrency(
+  country: string | null | undefined,
+  overrides?: Record<string, string> | null,
+): string | undefined {
+  if (!country) return undefined;
+  const code = country.trim().toUpperCase();
+  const override = overrides?.[code];
+  if (override) return override.toUpperCase();
+  return COUNTRY_SETTLEMENT_CURRENCY[code];
+}
+
+export function settlementCurrencyForCountry(
+  country?: string | null,
+  overrides?: Record<string, string> | null,
+): string {
+  return resolveSettlementCurrency(country, overrides) ?? DEFAULT_SETTLEMENT_CURRENCY;
 }
 
 @Entity('merchants')
@@ -195,6 +341,19 @@ export class Merchant {
 
   @Column({ default: false })
   sandboxMode: boolean;
+
+  /** True once the merchant has confirmed ownership of `email` (#844). Unverified merchants are restricted to sandbox mode (#888). */
+  @Column({ name: 'email_verified', default: false })
+  emailVerified: boolean;
+
+  /** SHA-256 hash of the outstanding email-verification token; null when none is pending. */
+  @Exclude()
+  @Column({ name: 'email_verification_token_hash', type: 'text', nullable: true, default: null })
+  emailVerificationTokenHash: string | null;
+
+  /** Expiry of the outstanding email-verification token (24h after issue). */
+  @Column({ name: 'email_verification_expires_at', type: 'timestamptz', nullable: true, default: null })
+  emailVerificationExpiresAt: Date | null;
 
   @Exclude()
   @Column({ nullable: true })

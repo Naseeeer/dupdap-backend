@@ -65,10 +65,24 @@ export class BatchCreatePaymentDto {
   })
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(20)
+  @ArrayMaxSize(20, { message: 'payments must contain no more than 20 items' })
   @ValidateNested({ each: true })
   @Type(() => BatchPaymentItemDto)
   payments: BatchPaymentItemDto[];
+}
+
+export class BatchPaymentResultItemDto {
+  @ApiProperty({ description: 'ID of the created payment' })
+  paymentId: string;
+
+  @ApiProperty({ description: 'Public reference of the created payment' })
+  reference: string;
+
+  @ApiProperty({ description: 'SEP-0007 Stellar payment URI for this payment' })
+  stellarUri: string;
+
+  @ApiProperty({ description: 'QR code (data URL) encoding the Stellar URI' })
+  qrCode: string;
 }
 
 export class BatchPaymentResultDto {
@@ -77,4 +91,10 @@ export class BatchPaymentResultDto {
 
   @ApiProperty({ description: 'Total number of payments created' })
   count: number;
+
+  @ApiProperty({
+    type: [BatchPaymentResultItemDto],
+    description: 'Per-item results, including the Stellar URI and QR code of each payment',
+  })
+  items: BatchPaymentResultItemDto[];
 }
