@@ -3,6 +3,7 @@ import { InjectQueue } from '@nestjs/bull';
 import { Queue } from 'bull';
 import axios from 'axios';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, IsNull, Raw, Repository } from 'typeorm';
 import axios from 'axios';
@@ -29,6 +30,13 @@ interface SettlementDecisionResult {
   success: boolean;
   settlement: Settlement;
 }
+
+const DEFAULT_SETTLEMENT_QUEUE_DEPTH_THRESHOLD = 50;
+
+const settlementQueueDepth = new Gauge({
+  name: 'settlement_queue_depth',
+  help: 'Number of jobs waiting in the settlement Bull queue',
+});
 
 export interface PartnerCallbackPayload {
   reference: string;
@@ -64,6 +72,40 @@ export class SettlementsService {
   private readonly settlementsRepo: Repository<Settlement>;
   private readonly paymentsRepo: Repository<Payment>;
   private readonly auditLogRepo: Repository<AuditLog>;
+  private readonly logger = new Logger(SettlementsService.name);
+
+  // ── Queue depth monitoring (#830) ──────────────────────────────────────────
+
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async monitorQueueDepth(): Promise<void> {
+    try {
+      const depth = await this.settlementQueue.getWaitingCount();
+      settlementQueueDepth.set(depth);
+
+      const threshold = this.queueDepthThreshold();
+      if (depth <= threshold) return;
+
+      this.logger.warn(`Settlement queue depth ${depth} exceeds threshold ${threshold}`);
+      await this.adminAlerts.raise({
+        type: AdminAlertType.SETTLEMENT_FAILURE,
+        dedupeKey: 'settlement_queue_depth',
+        message: `Settlement queue depth is ${depth}, above the threshold of ${threshold}.`,
+        metadata: { queue: 'settlements', depth, threshold },
+        thresholdValue: depth,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Failed to check settlement queue depth: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+  }
+
+  private queueDepthThreshold(): number {
+    const configured = Number(this.config.get<string>('SETTLEMENT_QUEUE_DEPTH_THRESHOLD'));
+    return Number.isFinite(configured) && configured > 0
+      ? configured
+      : DEFAULT_SETTLEMENT_QUEUE_DEPTH_THRESHOLD;
+  }
 
   private readonly fees = new FeeCalculationService();
 
@@ -320,6 +362,73 @@ export class SettlementsService {
     };
   }
 
+  // ── Small payment batching (#831) ──────────────────────────────────────────
+
+  /** Payments below this USD amount are batched instead of settled immediately. */
+  private static readonly SMALL_PAYMENT_THRESHOLD_USD = 10;
+
+  /**
+   * Flushes confirmed small payments per merchant once their combined value
+   * reaches the small-payment threshold.
+   *
+   * `payments.amountUsd` is a `decimal` column mapped to a string, so the
+   * comparison is done numerically in SQL (`amountUsd::numeric < :threshold`)
+   * rather than with TypeORM `LessThan()` on a number, which would compare
+   * against a string literal and mis-order values such as '9.99' vs '10.00'.
+   */
+  async batchSmallConfirmedPayments(): Promise<void> {
+    const threshold = SettlementsService.SMALL_PAYMENT_THRESHOLD_USD;
+
+    const smallPayments = await this.paymentsRepo
+      .createQueryBuilder('payment')
+      .where('payment.status = :status', { status: PaymentStatus.CONFIRMED })
+      .andWhere('payment.settlementId IS NULL')
+      .andWhere('payment.amountUsd::numeric < :threshold', { threshold })
+      .orderBy('payment.confirmedAt', 'ASC')
+      .getMany();
+
+    if (!smallPayments.length) return;
+
+    const byMerchant = new Map<string, Payment[]>();
+    for (const payment of smallPayments) {
+      const group = byMerchant.get(payment.merchantId) ?? [];
+      group.push(payment);
+      byMerchant.set(payment.merchantId, group);
+    }
+
+    for (const [merchantId, payments] of byMerchant) {
+      const total = payments.reduce((sum, p) => sum + Number(p.amountUsd), 0);
+      if (total < threshold) continue;
+
+      const totalAmountUsd = total.toFixed(6);
+      const feeAmountUsd = (total * 0.015).toFixed(6);
+      const netAmountUsd = (total - Number(feeAmountUsd)).toFixed(6);
+
+      const settlement = this.settlementsRepo.create({
+        merchantId,
+        totalAmountUsd,
+        feeAmountUsd,
+        netAmountUsd,
+        fiatCurrency: 'NGN',
+        status: SettlementStatus.PROCESSING,
+        requiresApproval: false,
+      });
+      await this.settlementsRepo.save(settlement);
+
+      for (const payment of payments) {
+        payment.status = PaymentStatus.SETTLING;
+        payment.settlementId = settlement.id;
+        await this.paymentsRepo.save(payment);
+      }
+
+      await this.settlementQueue.add(
+        'dispatch',
+        { settlementId: settlement.id },
+        { attempts: this.retryConfig.settlement.maxAttempts + 1 },
+      );
+    }
+  }
+
   // ── Fiat transfer ──────────────────────────────────────────────────────────
 
   private static readonly PARTNER_TIMEOUT_MS = 30_000;
@@ -345,6 +454,42 @@ export class SettlementsService {
 
       this.consecutiveTimeouts.delete(settlement.id);
       settlement.partnerReference = data?.reference;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+
+      if (axios.isAxiosError?.(err) && err.code === 'ECONNABORTED') {
+        const count = (this.consecutiveTimeouts.get(settlement.id) ?? 0) + 1;
+        this.consecutiveTimeouts.set(settlement.id, count);
+        if (count >= SettlementsService.TIMEOUT_ALERT_THRESHOLD) {
+          await this.adminAlerts.raise({
+            type: AdminAlertType.SETTLEMENT_FAILURE,
+            dedupeKey: `settlement-timeout:${settlement.id}`,
+            message: `Partner API timed out ${count} consecutive times for settlement ${settlement.id}`,
+            metadata: { settlementId: settlement.id, consecutiveTimeouts: count },
+            thresholdValue: count,
+          });
+        }
+        // Rethrow so Bull retries; settlement stays PROCESSING.
+        throw new Error(`Partner API timeout for settlement ${settlement.id}: ${message}`);
+      }
+
+      this.consecutiveTimeouts.delete(settlement.id);
+      settlement.status = SettlementStatus.FAILED;
+      settlement.failureReason = message;
+      await this.settlementsRepo.save(settlement);
+      for (const payment of payments) {
+        payment.status = PaymentStatus.FAILED;
+        await this.paymentsRepo.save(payment);
+      }
+      await this.adminAlerts.raise({
+        type: AdminAlertType.SETTLEMENT_FAILURE,
+        dedupeKey: `settlement:${settlement.id}`,
+        message: `Settlement ${settlement.id} failed: ${message}`,
+        metadata: { settlementId: settlement.id },
+        thresholdValue: 1,
+      });
+    }
+  }
 
   // ── Partner callback ───────────────────────────────────────────────────────
 
@@ -384,40 +529,8 @@ export class SettlementsService {
         });
       }
       this.analytics.clearCacheForMerchant(settlement.merchantId);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-
-      if (axios.isAxiosError?.(err) && err.code === 'ECONNABORTED') {
-        const count = (this.consecutiveTimeouts.get(settlement.id) ?? 0) + 1;
-        this.consecutiveTimeouts.set(settlement.id, count);
-        if (count >= SettlementsService.TIMEOUT_ALERT_THRESHOLD) {
-          await this.adminAlerts.raise({
-            type: AdminAlertType.SETTLEMENT_FAILURE,
-            dedupeKey: `settlement-timeout:${settlement.id}`,
-            message: `Partner API timed out ${count} consecutive times for settlement ${settlement.id}`,
-            metadata: { settlementId: settlement.id, consecutiveTimeouts: count },
-            thresholdValue: count,
-          });
-        }
-        // Rethrow so Bull retries; settlement stays PROCESSING.
-        throw new Error(`Partner API timeout for settlement ${settlement.id}: ${message}`);
-      }
-
-      this.consecutiveTimeouts.delete(settlement.id);
-      settlement.status = SettlementStatus.FAILED;
-      settlement.failureReason = message;
-      await this.settlementsRepo.save(settlement);
-      for (const payment of payments) {
-        payment.status = PaymentStatus.FAILED;
-        await this.paymentsRepo.save(payment);
-      }
-      await this.adminAlerts.raise({
-        type: AdminAlertType.SETTLEMENT_FAILURE,
-        dedupeKey: `settlement:${settlement.id}`,
-        message: `Settlement ${settlement.id} failed: ${message}`,
-        metadata: { settlementId: settlement.id },
-        thresholdValue: 1,
-      });
+    }
+  }
     }
   }
 
@@ -442,6 +555,39 @@ export class SettlementsService {
       ip: undefined,
     });
     await this.auditLogRepo.save(log);
+  }
+
+  /**
+   * Sends the settlement status email to the merchant (#832).
+   * Used by the non-callback completion path so it matches the partner
+   * callback path. Never throws: email failures must not fail a settlement.
+   */
+  private async sendSettlementCompletionEmail(settlement: Settlement): Promise<void> {
+    try {
+      const merchant =
+        settlement.merchant ??
+        (settlement.merchantId
+          ? await this.merchantsService.findOne(settlement.merchantId)
+          : undefined);
+      if (!merchant?.email) return;
+
+      await this.emailService.sendSettlementStatusEmail(
+        merchant.email,
+        {
+          id: settlement.id,
+          status: settlement.status,
+          totalAmountUsd: settlement.totalAmountUsd,
+          netAmountUsd: settlement.netAmountUsd,
+        },
+        {
+          totalAmountUsd: settlement.totalAmountUsd,
+          feeAmountUsd: settlement.feeAmountUsd,
+          netAmountUsd: settlement.netAmountUsd,
+        },
+      );
+    } catch {
+      // Swallow: notification is best-effort and must not break settlement.
+    }
   }
 
   private async executeFiatTransfer(settlement: Settlement): Promise<void> {
@@ -490,6 +636,8 @@ export class SettlementsService {
     const merchant = await this.merchantsService.findOne(settlement.merchantId).catch(() => null);
     if (merchant?.email) {
       await this.emailService.sendSettlementStatusEmail(merchant.email, settlement);
+    }
+  }
     }
   }
 
