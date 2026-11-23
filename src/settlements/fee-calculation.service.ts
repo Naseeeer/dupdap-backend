@@ -23,21 +23,41 @@ const FEE_TIERS: FeeTier[] = [
 
 @Injectable()
 export class FeeCalculationService {
-  async calculateFee(merchantId: string, amountUsd: number): Promise<FeeResult> {
+  async calculateFee(
+    merchantId: string,
+    amountUsd: number,
+    customFeeRate?: number | string | null,
+  ): Promise<FeeResult> {
     if (!Number.isFinite(amountUsd) || amountUsd < 0) {
       throw new BadRequestException(`Invalid amount for merchant ${merchantId}: ${amountUsd}`);
     }
 
     const tier = this.resolveTier(amountUsd);
-    const feeUsd = this.round(amountUsd * tier.rate);
+    const rate = this.resolveFeeRate(customFeeRate, tier.rate);
+    const feeUsd = this.round(amountUsd * rate);
     const netUsd = this.round(amountUsd - feeUsd);
 
     return {
       feeUsd,
-      feeRate: tier.rate,
+      feeRate: rate,
       tierName: tier.name,
       netUsd,
     };
+  }
+
+  /**
+   * Uses the merchant's custom fee rate when set, otherwise falls back to the
+   * tier (global batch) rate. Invalid or negative overrides are ignored.
+   */
+  resolveFeeRate(customFeeRate: number | string | null | undefined, fallbackRate: number): number {
+    if (customFeeRate === null || customFeeRate === undefined || customFeeRate === '') {
+      return fallbackRate;
+    }
+    const parsed = typeof customFeeRate === 'number' ? customFeeRate : Number(customFeeRate);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return fallbackRate;
+    }
+    return parsed;
   }
 
   private resolveTier(amountUsd: number): FeeTier {
