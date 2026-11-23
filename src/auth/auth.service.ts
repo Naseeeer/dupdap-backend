@@ -15,6 +15,23 @@ export const MAX_FAILED_LOGIN_ATTEMPTS = 5;
 /** How long a lockout lasts, in seconds. */
 export const LOGIN_LOCKOUT_SECONDS = 15 * 60;
 
+/**
+ * Cost factor used for merchant password hashes. Kept in sync with the value
+ * used when hashing passwords so the dummy comparison below costs the same.
+ */
+const PASSWORD_HASH_ROUNDS = 10;
+
+/**
+ * Pre-computed bcrypt hash of a random, never-issued password. It is compared
+ * against when no merchant matches the login email so that the login endpoint
+ * takes the same time whether or not the account exists (no user enumeration
+ * via response timing).
+ */
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(
+  'dupdap-dummy-password-for-constant-time-login',
+  PASSWORD_HASH_ROUNDS,
+);
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -67,6 +84,13 @@ export class AuthService {
     ]);
   }
 
+  /**
+   * Verify merchant credentials.
+   *
+   * Always performs exactly one bcrypt comparison, even when the merchant is
+   * not found, so response timing does not reveal whether an email is
+   * registered.
+   */
   async login(dto: LoginDto): Promise<AuthTokenResponseDto> {
     const email = dto.email.toLowerCase();
 
@@ -74,10 +98,15 @@ export class AuthService {
       throw new UnauthorizedException('Account temporarily locked. Try again later.');
     }
 
-    const merchant = await this.merchants.findOne({ where: { email } });
-    const passwordMatches = merchant
-      ? await bcrypt.compare(dto.password, merchant.passwordHash)
-      : false;
+    const merchant = await this.merchants.findOne({
+      where: { email },
+      select: ['id', 'email', 'passwordHash'],
+    });
+
+    const passwordMatches = await bcrypt.compare(
+      dto.password,
+      merchant?.passwordHash ?? DUMMY_PASSWORD_HASH,
+    );
 
     if (!merchant || !passwordMatches) {
       await this.registerFailedLogin(email);

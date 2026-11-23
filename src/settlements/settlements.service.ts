@@ -26,6 +26,13 @@ import { FeeCalculationService } from './fee-calculation.service';
 const SMALL_BATCH_THRESHOLD_USD = 10;
 const BATCH_FEE_RATE = 0.015;
 
+/**
+ * Settlements at or above this USD amount require manual admin approval
+ * before they are dispatched to the partner. Shared by every settlement
+ * creation path so the threshold cannot drift between them.
+ */
+export const LARGE_SETTLEMENT_THRESHOLD = 10000;
+
 interface SettlementDecisionResult {
   success: boolean;
   settlement: Settlement;
@@ -410,6 +417,9 @@ export class SettlementsService {
     status?: string;
     merchantId?: string;
     requiresApproval?: boolean;
+    dateField?: 'created' | 'completed';
+    from?: string;
+    to?: string;
   }) {
     const qb = this.settlementsRepo
       .createQueryBuilder('settlement')
@@ -424,6 +434,13 @@ export class SettlementsService {
       qb.andWhere('settlement.requiresApproval = :requiresApproval', {
         requiresApproval: query.requiresApproval,
       });
+    }
+
+    if (query.from || query.to) {
+      const dateColumn =
+        query.dateField === 'completed' ? 'settlement.completedAt' : 'settlement.createdAt';
+      if (query.from) qb.andWhere(`${dateColumn} >= :from`, { from: new Date(query.from) });
+      if (query.to) qb.andWhere(`${dateColumn} <= :to`, { to: new Date(query.to) });
     }
 
     const [items, total] = await qb
