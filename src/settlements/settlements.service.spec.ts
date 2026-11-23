@@ -1,4 +1,6 @@
 import { ConfigService } from '@nestjs/config';
+import { UnauthorizedException } from '@nestjs/common';
+import { createHmac } from 'crypto';
 import axios from 'axios';
 import { SettlementsService } from './settlements.service';
 import { Settlement, SettlementStatus } from './entities/settlement.entity';
@@ -519,7 +521,9 @@ describe('SettlementsService handlePartnerCallback', () => {
   let analytics: AnalyticsService;
 
   const deps = () => ({
-    config: { get: jest.fn() } as unknown as ConfigService,
+    config: {
+      get: jest.fn((key: string) => (key === 'PARTNER_WEBHOOK_SECRET' ? 'test-secret' : undefined)),
+    } as unknown as ConfigService,
     webhooks: { dispatch: jest.fn().mockResolvedValue(undefined) } as unknown as WebhooksService,
     adminAlerts: {
       raise: jest.fn().mockResolvedValue(null),
@@ -618,6 +622,29 @@ describe('SettlementsService handlePartnerCallback', () => {
     expect(analytics.clearCacheForMerchant).not.toHaveBeenCalled();
   });
 
+  it('ignores duplicate callback for already-failed settlement', async () => {
+    const payment = { id: 'p1', amountUsd: '100.000000', status: PaymentStatus.FAILED } as Payment;
+    const settlement = {
+      id: 'settlement-1',
+      merchantId: 'merchant-xyz',
+      payments: [payment],
+      status: SettlementStatus.FAILED,
+    } as Settlement;
+
+    settlementsRepo.findOne.mockResolvedValue(settlement);
+
+    const result = await service.handlePartnerCallback({
+      reference: 'settlement-1',
+      status: 'success',
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(settlementsRepo.save).not.toHaveBeenCalled();
+    expect(paymentsRepo.save).not.toHaveBeenCalled();
+    expect(stellar.invokeContract).not.toHaveBeenCalled();
+    expect(webhooks.dispatch).not.toHaveBeenCalled();
+  });
+
   it('returns early for unknown settlement reference', async () => {
     settlementsRepo.findOne.mockResolvedValue(null);
 
@@ -646,6 +673,37 @@ describe('SettlementsService handlePartnerCallback', () => {
       paymentId: 'p1',
       reason: 'Bank declined',
     });
+  });
+
+  it('rejects callback with missing signature (401)', async () => {
+    await expect(
+      service.handlePartnerCallback({ reference: 'settlement-1', status: 'success' }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(settlementsRepo.findOne).not.toHaveBeenCalled();
+  });
+
+  it('rejects callback with invalid signature (401)', async () => {
+    await expect(
+      service.handlePartnerCallback({ reference: 'settlement-1', status: 'success' }, 'deadbeef'),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(settlementsRepo.findOne).not.toHaveBeenCalled();
+  });
+
+  it('accepts callback with valid HMAC-SHA256 signature', async () => {
+    const payload = { reference: 'settlement-1', status: 'success' };
+    const rawBody = Buffer.from(JSON.stringify(payload));
+    const signature = createHmac('sha256', 'test-secret').update(rawBody).digest('hex');
+    const settlement = {
+      id: 'settlement-1',
+      merchantId: 'merchant-xyz',
+      payments: [],
+      status: SettlementStatus.PROCESSING,
+    } as Settlement;
+    settlementsRepo.findOne.mockResolvedValue(settlement);
+
+    await service.handlePartnerCallback(payload, signature, rawBody);
+
+    expect(settlement.status).toBe(SettlementStatus.COMPLETED);
   });
 });
 

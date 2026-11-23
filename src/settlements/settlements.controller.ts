@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Query, UseGuards, Request, Body, HttpCode, HttpStatus, Param, Header, ParseUUIDPipe } from '@nestjs/common';
+import { Controller, Get, Post, Query, UseGuards, Request, Body, HttpCode, HttpStatus, Param, Header, Headers, Req, ParseUUIDPipe } from '@nestjs/common';
 import {
   ApiTags,
   ApiBearerAuth,
@@ -75,7 +75,12 @@ export class PartnerCallbackController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Receive fiat settlement status callback from partner API' })
   @ApiHeader({ name: 'X-Partner-Signature', description: 'HMAC-SHA256 signature of the request body', required: true })
-  handleCallback(@Body() payload: PartnerCallbackPayload) {
-    return this.settlementsService.handlePartnerCallback(payload);
+  @ApiUnauthorizedResponse({ description: 'Missing or invalid partner signature' })
+  handleCallback(
+    @Body() payload: PartnerCallbackPayload,
+    @Headers('x-partner-signature') signature?: string,
+    @Req() req?: { rawBody?: Buffer },
+  ) {
+    return this.settlementsService.handlePartnerCallback(payload, signature, req?.rawBody);
   }
 }
