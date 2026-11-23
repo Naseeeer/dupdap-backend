@@ -100,6 +100,7 @@ export class Payment {
   @Transform(({ value }) => maskEmail(value), { toPlainOnly: true })
   customerEmail: string;
 
+  @Index('IDX_payments_metadata_gin', { synchronize: false })
   @Column({ type: 'jsonb', nullable: true })
   metadata: Record<string, any>;
 
